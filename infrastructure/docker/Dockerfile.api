@@ -1,0 +1,67 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bangalore Transit Twin — Serving API
+#  Multi-stage build: builder installs deps, final image is lean (~200MB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: dependency builder ───────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# System deps needed to compile some Python packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc libpq-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .
+# Install only the serving-layer deps (not the full ML stack)
+RUN pip install --upgrade pip && \
+    pip install --prefix=/install \
+        fastapi>=0.111 \
+        uvicorn[standard]>=0.29 \
+        websockets>=12 \
+        redis[asyncio]>=5.0 \
+        pydantic>=2.7 \
+        pydantic-settings>=2.3 \
+        httpx>=0.27 \
+        structlog>=24 \
+        prometheus-client>=0.20 \
+        python-dotenv>=1.0 \
+        opentelemetry-sdk>=1.24 \
+        tenacity>=8.3
+
+# ── Stage 2: runtime image ────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+# Non-root user for security
+RUN groupadd --gid 1001 transit && \
+    useradd --uid 1001 --gid transit --shell /bin/bash --create-home transit
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy application source
+COPY serving_layer/ ./serving_layer/
+COPY .env.example .env.example
+
+# Ensure Python can find the package
+ENV PYTHONPATH=/app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+USER transit
+
+EXPOSE 8000
+
+# Healthcheck for Kubernetes liveness probe
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "serving_layer.api.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "2", \
+     "--log-level", "info", \
+     "--access-log"]

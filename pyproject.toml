@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "bangalore-transit-twin"
@@ -65,7 +65,7 @@ dependencies = [
 
     # ── LLMOps ───────────────────────────────────────
     "haystack-ai>=2.2",
-    "milvus-haystack>=0.3",
+    "milvus-haystack>=0.1.0",
     "vllm>=0.5",
 
     # ── Observability ────────────────────────────────

@@ -1,0 +1,75 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# ── Secrets & Config ──────────────────────────────────────────────────────────
+.env
+*.json.key
+*-sa-key.json
+secrets/
+.secrets/
+
+# ── GCP ───────────────────────────────────────────────────────────────────────
+application_default_credentials.json
+gcloud/
+
+# ── DVC ───────────────────────────────────────────────────────────────────────
+/tmp/
+*.dvc/tmp
+.dvc/cache
+
+# ── MLflow ────────────────────────────────────────────────────────────────────
+mlruns/
+mlartifacts/
+
+# ── dbt ───────────────────────────────────────────────────────────────────────
+data_engineering/dbt/target/
+data_engineering/dbt/dbt_packages/
+data_engineering/dbt/logs/
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.docker/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Notebooks ─────────────────────────────────────────────────────────────────
+notebooks/.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Flink ─────────────────────────────────────────────────────────────────────
+stream_processing/flink/target/
+*.jar
+
+# ── Data files ────────────────────────────────────────────────────────────────
+*.csv
+*.parquet
+*.zip
+data/
+!data/.keep
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/

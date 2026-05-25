@@ -31,7 +31,7 @@ from typing import AsyncGenerator
 
 import redis.asyncio as aioredis
 import structlog
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
@@ -50,6 +50,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()
@@ -192,7 +193,8 @@ app.add_middleware(
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
-async def health(request_redis: aioredis.Redis = None) -> HealthResponse:
+async def health() -> HealthResponse:
+    # We grab the redis client directly from the app state
     redis = app.state.redis
     try:
         await redis.ping()

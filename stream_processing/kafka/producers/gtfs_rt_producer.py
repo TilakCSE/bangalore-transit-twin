@@ -75,28 +75,29 @@ FEEDS: list[FeedConfig] = [
         name="bmtc",
         vehicle_positions_url=os.getenv(
             "BMTC_GTFS_RT_VEHICLE_POSITIONS_URL",
-            "https://bmtcwebportal.pascos.in/gtfs-rt/vehiclePositions",
+            "https://cdn.mbta.com/realtime/VehiclePositions.pb",
         ),
         trip_updates_url=os.getenv(
             "BMTC_GTFS_RT_TRIP_UPDATES_URL",
-            "https://bmtcwebportal.pascos.in/gtfs-rt/tripUpdates",
+            "https://cdn.mbta.com/realtime/TripUpdates.pb",
         ),
         poll_interval_sec=15,
     ),
-    FeedConfig(
-        name="namma_metro",
-        vehicle_positions_url=os.getenv(
-            "NAMMA_METRO_GTFS_RT_URL",
-            "https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb",
-        ),
-        trip_updates_url=os.getenv(
-            "NAMMA_METRO_TRIP_UPDATES_URL",
-            "https://otd.delhi.gov.in/api/realtime/TripUpdates.pb",
-        ),
-        poll_interval_sec=10,
-        headers={"x-api-key": os.getenv("OTD_API_KEY", "")},
-    ),
 ]
+
+# --- COMMENTED OUT THE METRO FEED FOR TONIGHT ---
+# _otd_key = os.getenv("OTD_API_KEY", "")
+# if _otd_key and _otd_key != "your-otd-api-key":
+#     FEEDS.append(
+#         FeedConfig(
+#             name="namma_metro",
+#             vehicle_positions_url=os.getenv("NAMMA_METRO_GTFS_RT_URL", ""),
+#             trip_updates_url=os.getenv("NAMMA_METRO_TRIP_UPDATES_URL", ""),
+#             poll_interval_sec=10,
+#             headers={"x-api-key": _otd_key},
+#         )
+#     )
+
 
 
 class GTFSRTProducer:
