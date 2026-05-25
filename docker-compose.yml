@@ -1,0 +1,260 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────
+#  Bangalore Transit Digital Twin — Local Dev Stack
+#  Services: Kafka, Zookeeper, Flink, Airflow, MLflow,
+#            Postgres, Redis, MinIO (S3-compatible)
+# ─────────────────────────────────────────────────────
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    PYTHONPATH: "/opt/airflow/plugins:/opt/airflow"
+    GCS_BUCKET: ${GCS_BUCKET:-transit-twin-local}
+    KAFKA_BOOTSTRAP: kafka:9092
+  volumes:
+    - ./data_engineering/airflow/dags:/opt/airflow/dags
+    - ./data_engineering/airflow/plugins:/opt/airflow/plugins
+    - ./data_engineering/ingestion:/opt/airflow/ingestion
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - transit-net
+
+services:
+  # ── Infrastructure ──────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    hostname: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - transit-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Topics for our pipeline
+      KAFKA_CREATE_TOPICS: >
+        vehicle-positions:4:1,
+        trip-updates:4:1,
+        service-alerts:2:1,
+        traffic-events:4:1,
+        flink-delay-output:2:1,
+        flink-bunching-alerts:2:1
+    networks:
+      - transit-net
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "kafka:29092"
+    networks:
+      - transit-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+    depends_on:
+      - kafka
+    networks:
+      - transit-net
+
+  # ── Flink ───────────────────────────────────────────
+  flink-jobmanager:
+    image: flink:1.19-scala_2.12-java11
+    hostname: flink-jobmanager
+    ports:
+      - "8082:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://transit-twin-local/flink-checkpoints
+        s3.endpoint: http://minio:9000
+        s3.path-style-access: true
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+    volumes:
+      - ./stream_processing/flink:/opt/flink/jobs
+    networks:
+      - transit-net
+
+  flink-taskmanager:
+    image: flink:1.19-scala_2.12-java11
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    scale: 2
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: rocksdb
+    networks:
+      - transit-net
+
+  # ── Storage ─────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    networks:
+      - transit-net
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/transit-twin-local --ignore-existing;
+      mc mb local/mlflow-artifacts --ignore-existing;
+      mc mb local/flink-checkpoints --ignore-existing;
+      echo 'MinIO buckets ready';
+      "
+    networks:
+      - transit-net
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    networks:
+      - transit-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - transit-net
+
+  # ── MLflow ──────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql+psycopg2://airflow:airflow@postgres/airflow
+      --default-artifact-root s3://mlflow-artifacts/
+      --serve-artifacts
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - transit-net
+
+  # ── Airflow ─────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --password admin
+          --firstname Admin --lastname User --role Admin --email admin@transit.local
+      "
+
+  airflow-webserver:
+    <<: *airflow-common
+    ports:
+      - "8083:8080"
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Serving Layer ────────────────────────────────────
+  transit-api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      REDIS_URL: redis://redis:6379
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      - kafka
+      - redis
+    networks:
+      - transit-net
+
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:
+
+networks:
+  transit-net:
+    driver: bridge
