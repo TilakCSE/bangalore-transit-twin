@@ -86,17 +86,19 @@ FEEDS: list[FeedConfig] = [
 ]
 
 # --- COMMENTED OUT THE METRO FEED FOR TONIGHT ---
-# _otd_key = os.getenv("OTD_API_KEY", "")
-# if _otd_key and _otd_key != "your-otd-api-key":
-#     FEEDS.append(
-#         FeedConfig(
-#             name="namma_metro",
-#             vehicle_positions_url=os.getenv("NAMMA_METRO_GTFS_RT_URL", ""),
-#             trip_updates_url=os.getenv("NAMMA_METRO_TRIP_UPDATES_URL", ""),
-#             poll_interval_sec=10,
-#             headers={"x-api-key": _otd_key},
-#         )
-#     )
+_otd_key = os.getenv("OTD_API_KEY", "")
+if _otd_key and _otd_key != "your-otd-api-key":
+    FEEDS.append(
+        FeedConfig(
+            name="namma_metro",
+            # Pass the URL with the key
+            vehicle_positions_url=f"https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb?key={_otd_key}",
+            # Set trip_updates_url to None so the producer skips it
+            trip_updates_url=None, 
+            poll_interval_sec=10,
+            headers={}, 
+        )
+    )
 
 
 
@@ -165,6 +167,8 @@ class GTFSRTProducer:
     async def _fetch_and_publish(
         self, feed: FeedConfig, feed_type: str, url: str
     ) -> None:
+        if not url:
+            return
         topic = (
             os.getenv("TOPIC_VEHICLE_POSITIONS", "vehicle-positions")
             if feed_type == "vehicle_positions"
