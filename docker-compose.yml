@@ -100,16 +100,26 @@ services:
       - "8082:8081"
     command: jobmanager
     environment:
-      FLINK_PROPERTIES: |
+    - AWS_ACCESS_KEY_ID=minioadmin
+    - AWS_SECRET_ACCESS_KEY=minioadmin
+      - |
+        FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         parallelism.default: 2
         state.backend: rocksdb
-        state.checkpoints.dir: s3://transit-twin-local/flink-checkpoints
+        state.checkpoints.dir: s3a://transit-twin-local/flink-checkpoints
         s3.endpoint: http://minio:9000
         s3.path-style-access: true
         s3.access-key: minioadmin
         s3.secret-key: minioadmin
+        fs.s3a.endpoint: http://minio:9000
+        fs.s3a.access.key: minioadmin
+        fs.s3a.secret.key: minioadmin
+        fs.s3a.path.style.access: true
+        fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
+        fs.s3a.signing-algorithm: S3SignerType
+        fs.s3a.aws.credentials.provider: org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
     volumes:
       - ./stream_processing/flink:/opt/flink/jobs
     networks:
