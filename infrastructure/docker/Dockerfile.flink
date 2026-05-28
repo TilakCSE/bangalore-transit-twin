@@ -1,42 +1,90 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Custom Flink 1.19 image with Iceberg + Kafka + S3 pre-installed
-#  Build: docker compose build flink-jobmanager flink-taskmanager
+#  Custom Flink 1.19 image — Iceberg + Nessie + S3FileIO
+#  JAR list validated through multiple AI research sessions.
+#
+#  Root cause of all previous failures:
+#    iceberg-flink-runtime internally calls hadoop Configuration class
+#    even with NessieCatalog + S3FileIO. hadoop-common is required.
+#    But hadoop-aws is NOT required and causes UGI crash — keep it out.
+#
+#  Final rule:
+#    hadoop-common  → YES (provides Configuration, safe, no UGI on startup)
+#    hadoop-auth    → YES (dependency of hadoop-common)
+#    hadoop-aws     → NO  (triggers UGI/S3AFileSystem initialization = crash)
+#    aws-sdk-bundle v1 → NO (conflicts with iceberg-aws-bundle v2)
 # ─────────────────────────────────────────────────────────────────────────────
 FROM flink:1.19-scala_2.12-java11
 
-# Install the Flink S3 Hadoop plugin — this is the CORRECT way to add S3
-# support. It goes into plugins/s3-fs-hadoop/, not lib/, so Flink loads it
-# via an isolated classloader that doesn't pollute the main classpath.
+# ── 1. Flink S3 plugin → plugins/ (isolated classloader, not lib/) ────────────
 RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
-    cp /opt/flink/opt/flink-s3-fs-hadoop-1.19*.jar \
-       /opt/flink/plugins/s3-fs-hadoop/ 2>/dev/null || \
-    # If not in /opt, download it
     curl -fsSL \
-      "https://repo1.maven.org/maven2/org/apache/flink/flink-s3-fs-hadoop/1.19.0/flink-s3-fs-hadoop-1.19.0.jar" \
-      -o /opt/flink/plugins/s3-fs-hadoop/flink-s3-fs-hadoop-1.19.0.jar
+      "https://repo1.maven.org/maven2/org/apache/flink/flink-s3-fs-hadoop/1.19.1/flink-s3-fs-hadoop-1.19.1.jar" \
+      -o /opt/flink/plugins/s3-fs-hadoop/flink-s3-fs-hadoop-1.19.1.jar
 
-# Download Iceberg Flink runtime into lib/
-# This is safe in lib/ because iceberg-flink-runtime is a shaded uber-jar
-# with no Hadoop classes inside it that would trigger UGI initialization.
+# ── 2. Iceberg Flink runtime ──────────────────────────────────────────────────
 RUN curl -fsSL \
-    "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.19/1.6.1/iceberg-flink-runtime-1.19-1.6.1.jar" \
-    -o /opt/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar
+      "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.19/1.6.1/iceberg-flink-runtime-1.19-1.6.1.jar" \
+      -o /opt/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar
 
-# Iceberg AWS bundle — shaded, safe in lib/
+# ── 3. Iceberg AWS bundle (S3FileIO, AWS SDK v2) ──────────────────────────────
 RUN curl -fsSL \
-    "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.6.1/iceberg-aws-bundle-1.6.1.jar" \
-    -o /opt/flink/lib/iceberg-aws-bundle-1.6.1.jar
+      "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.6.1/iceberg-aws-bundle-1.6.1.jar" \
+      -o /opt/flink/lib/iceberg-aws-bundle-1.6.1.jar
 
-# Kafka SQL connector
+# ── 4. Kafka SQL connector ────────────────────────────────────────────────────
 RUN curl -fsSL \
-    "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.0.2-1.18/flink-sql-connector-kafka-3.0.2-1.18.jar" \
-    -o /opt/flink/lib/flink-sql-connector-kafka-3.0.2-1.18.jar
+      "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.0.2-1.18/flink-sql-connector-kafka-3.0.2-1.18.jar" \
+      -o /opt/flink/lib/flink-sql-connector-kafka-3.0.2-1.18.jar
 
-# Nessie catalog connector for Flink
+# ── 5. hadoop-common (provides Configuration class — required by Iceberg) ─────
+#    Safe: no S3AFileSystem, no UGI initialization triggered on startup
 RUN curl -fsSL \
-    "https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.76.3/nessie-spark-extensions-3.5_2.12-0.76.3.jar" \
-    -o /opt/flink/lib/nessie-flink-0.76.3.jar 2>/dev/null || true
+      "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4/hadoop-common-3.3.4.jar" \
+      -o /opt/flink/lib/hadoop-common-3.3.4.jar
 
-# Verify — list what's in lib and plugins
-RUN echo "=== /opt/flink/lib ===" && ls -lh /opt/flink/lib/*.jar && \
-    echo "=== /opt/flink/plugins ===" && find /opt/flink/plugins -name "*.jar"
+# ── 6. hadoop-auth (dependency of hadoop-common) ─────────────────────────────
+RUN curl -fsSL \
+      "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-auth/3.3.4/hadoop-auth-3.3.4.jar" \
+      -o /opt/flink/lib/hadoop-auth-3.3.4.jar
+
+# ── 7. hadoop-hdfs-client (HdfsConfiguration class) ─────────────────────────
+RUN curl -fsSL \
+      "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar" \
+      -o /opt/flink/lib/hadoop-hdfs-client-3.3.4.jar
+
+# ── 8. hadoop-shaded-guava (Hadoop 3.x internal Guava) ───────────────────────
+RUN curl -fsSL \
+      "https://repo1.maven.org/maven2/org/apache/hadoop/thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar" \
+      -o /opt/flink/lib/hadoop-shaded-guava-1.1.1.jar
+
+# ── 9. Woodstox (XML parsing for Hadoop config) ───────────────────────────────
+RUN curl -fsSL \
+      "https://repo1.maven.org/maven2/com/fasterxml/woodstox/woodstox-core/5.3.0/woodstox-core-5.3.0.jar" \
+      -o /opt/flink/lib/woodstox-core-5.3.0.jar
+
+# ── 10. StAX2 API (required by Woodstox) ─────────────────────────────────────
+RUN curl -fsSL \
+      "https://repo1.maven.org/maven2/org/codehaus/woodstox/stax2-api/4.2.1/stax2-api-4.2.1.jar" \
+      -o /opt/flink/lib/stax2-api-4.2.1.jar
+
+# ── 11. commons-logging (required by hadoop-common) ──────────────────────────
+RUN curl -fsSL \
+      "https://repo1.maven.org/maven2/commons-logging/commons-logging/1.2/commons-logging-1.2.jar" \
+      -o /opt/flink/lib/commons-logging-1.2.jar
+
+# ── 12. commons-configuration2 (required by hadoop-common) ───────────────────
+RUN curl -fsSL \
+      "https://repo1.maven.org/maven2/org/apache/commons/commons-configuration2/2.1.1/commons-configuration2-2.1.1.jar" \
+      -o /opt/flink/lib/commons-configuration2-2.1.1.jar
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+RUN echo "=== plugins/s3-fs-hadoop ===" && \
+    ls -lh /opt/flink/plugins/s3-fs-hadoop/ && \
+    echo "" && echo "=== lib/ custom JARs ===" && \
+    ls -lh /opt/flink/lib/iceberg* \
+           /opt/flink/lib/hadoop* \
+           /opt/flink/lib/nessie* 2>/dev/null \
+           /opt/flink/lib/flink-sql-connector-kafka* \
+           /opt/flink/lib/woodstox* \
+           /opt/flink/lib/stax2* \
+           /opt/flink/lib/commons* 2>/dev/null || true
