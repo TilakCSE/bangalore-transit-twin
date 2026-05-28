@@ -1,5 +1,11 @@
 version: "3.9"
 
+# ─────────────────────────────────────────────────────
+#  Bangalore Transit Digital Twin — Local Dev Stack
+#  Flink uses a custom image with all JARs pre-baked.
+#  No more copying JARs, no more classpath conflicts.
+# ─────────────────────────────────────────────────────
+
 x-airflow-common: &airflow-common
   image: apache/airflow:2.9.1-python3.11
   environment: &airflow-common-env
@@ -23,8 +29,14 @@ x-airflow-common: &airflow-common
   networks:
     - transit-net
 
+# ── Shared Flink config ───────────────────────────────
+# Uses the custom-built image. S3 plugin is in plugins/s3-fs-hadoop/
+# so it loads in an isolated classloader — no UGI initialization on startup.
 x-flink-common: &flink-common
-  image: flink:1.19-scala_2.12-java11
+  build:
+    context: .
+    dockerfile: infrastructure/docker/Dockerfile.flink
+  image: bangalore-transit-flink:1.19
   environment:
     - AWS_ACCESS_KEY_ID=minioadmin
     - AWS_SECRET_ACCESS_KEY=minioadmin
@@ -40,12 +52,11 @@ x-flink-common: &flink-common
       s3.path-style-access: true
       s3.access-key: minioadmin
       s3.secret-key: minioadmin
-  volumes:
-    - flink-lib:/opt/flink/lib
   networks:
     - transit-net
 
 services:
+  # ── Kafka ─────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     hostname: zookeeper
@@ -98,7 +109,7 @@ services:
     networks:
       - transit-net
 
-  # ── Flink ─────────────────────────────────────────────
+  # ── Flink (custom image) ──────────────────────────────
   flink-jobmanager:
     <<: *flink-common
     hostname: flink-jobmanager
@@ -107,7 +118,6 @@ services:
     command: jobmanager
     volumes:
       - ./stream_processing/flink:/opt/flink/jobs
-      - flink-lib:/opt/flink/lib
 
   flink-taskmanager:
     <<: *flink-common
@@ -115,12 +125,8 @@ services:
       - flink-jobmanager
     command: taskmanager
     scale: 2
-    volumes:
-      - flink-lib:/opt/flink/lib
 
   # ── Nessie REST Catalog ───────────────────────────────
-  # Provides a proper Iceberg REST catalog with zero Hadoop dependency.
-  # Flink talks to Nessie over HTTP — no hadoop-hdfs, no hadoop-common needed.
   nessie:
     image: projectnessie/nessie:0.76.3
     ports:
@@ -131,9 +137,10 @@ services:
     networks:
       - transit-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:19120/api/v2/config || exit 1"]
       interval: 10s
       retries: 5
+      start_period: 15s
 
   # ── MinIO ─────────────────────────────────────────────
   minio:
@@ -149,14 +156,18 @@ services:
       - minio-data:/data
     networks:
       - transit-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 5
 
   minio-init:
     image: minio/mc:latest
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      sleep 5;
       mc alias set local http://minio:9000 minioadmin minioadmin;
       mc mb local/transit-twin-local --ignore-existing;
       mc mb local/mlflow-artifacts --ignore-existing;
@@ -165,6 +176,7 @@ services:
     networks:
       - transit-net
 
+  # ── Postgres ──────────────────────────────────────────
   postgres:
     image: postgres:15
     environment:
@@ -256,7 +268,6 @@ volumes:
   postgres-data:
   minio-data:
   airflow-logs:
-  flink-lib:
 
 networks:
   transit-net:

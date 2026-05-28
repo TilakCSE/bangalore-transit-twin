@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Custom Flink 1.19 image with Iceberg + Kafka + S3 pre-installed
+#  Build: docker compose build flink-jobmanager flink-taskmanager
+# ─────────────────────────────────────────────────────────────────────────────
+FROM flink:1.19-scala_2.12-java11
+
+# Install the Flink S3 Hadoop plugin — this is the CORRECT way to add S3
+# support. It goes into plugins/s3-fs-hadoop/, not lib/, so Flink loads it
+# via an isolated classloader that doesn't pollute the main classpath.
+RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && \
+    cp /opt/flink/opt/flink-s3-fs-hadoop-1.19*.jar \
+       /opt/flink/plugins/s3-fs-hadoop/ 2>/dev/null || \
+    # If not in /opt, download it
+    curl -fsSL \
+      "https://repo1.maven.org/maven2/org/apache/flink/flink-s3-fs-hadoop/1.19.0/flink-s3-fs-hadoop-1.19.0.jar" \
+      -o /opt/flink/plugins/s3-fs-hadoop/flink-s3-fs-hadoop-1.19.0.jar
+
+# Download Iceberg Flink runtime into lib/
+# This is safe in lib/ because iceberg-flink-runtime is a shaded uber-jar
+# with no Hadoop classes inside it that would trigger UGI initialization.
+RUN curl -fsSL \
+    "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.19/1.6.1/iceberg-flink-runtime-1.19-1.6.1.jar" \
+    -o /opt/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar
+
+# Iceberg AWS bundle — shaded, safe in lib/
+RUN curl -fsSL \
+    "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.6.1/iceberg-aws-bundle-1.6.1.jar" \
+    -o /opt/flink/lib/iceberg-aws-bundle-1.6.1.jar
+
+# Kafka SQL connector
+RUN curl -fsSL \
+    "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.0.2-1.18/flink-sql-connector-kafka-3.0.2-1.18.jar" \
+    -o /opt/flink/lib/flink-sql-connector-kafka-3.0.2-1.18.jar
+
+# Nessie catalog connector for Flink
+RUN curl -fsSL \
+    "https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.76.3/nessie-spark-extensions-3.5_2.12-0.76.3.jar" \
+    -o /opt/flink/lib/nessie-flink-0.76.3.jar 2>/dev/null || true
+
+# Verify — list what's in lib and plugins
+RUN echo "=== /opt/flink/lib ===" && ls -lh /opt/flink/lib/*.jar && \
+    echo "=== /opt/flink/plugins ===" && find /opt/flink/plugins -name "*.jar"

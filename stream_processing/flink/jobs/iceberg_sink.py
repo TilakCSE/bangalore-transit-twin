@@ -1,14 +1,10 @@
 """
-Flink → Iceberg Bronze Sink
+Flink → Iceberg Bronze Sink  (Nessie REST catalog + S3FileIO)
 ─────────────────────────────────────────────────────────────────────────────
-Uses the Iceberg AWS Bundle (AWS SDK v2) instead of hadoop-aws (SDK v1).
-This is Option B from the research doc and avoids ALL the classpath conflicts.
+No JAR copying. No container restarts. No Hadoop classpath fights.
+All JARs are pre-baked into the custom Flink image (Dockerfile.flink).
 
-Strategy:
-  - warehouse uses s3:// (not s3a://) — matched to S3FileIO
-  - io-impl = org.apache.iceberg.aws.s3.S3FileIO (Iceberg manages S3 directly)
-  - Only 3 JARs needed: iceberg-flink-runtime, iceberg-aws-bundle, kafka connector
-  - Runs SQL inside the Docker container via sql-client.sh (no PyFlink classpath)
+This script just submits the SQL via the Flink SQL Client CLI inside Docker.
 
 Run:
     python3 -m stream_processing.flink.jobs.iceberg_sink
@@ -26,62 +22,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
 FLINK_REST_URL        = "http://localhost:8082"
 FLINK_KAFKA_BOOTSTRAP = os.getenv("FLINK_KAFKA_BOOTSTRAP", "kafka:29092")
-# s3:// matches S3FileIO (Option B — no hadoop-aws needed)
-ICEBERG_WAREHOUSE     = "s3://transit-twin-local/lakehouse"
+MINIO_ENDPOINT        = "http://minio:9000"
 AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
-MINIO_ENDPOINT        = "http://minio:9000"   # internal Docker DNS
+NESSIE_URI            = "http://nessie:19120/api/v1"
+WAREHOUSE             = "s3://transit-twin-local/lakehouse"
 TOPIC_VEHICLE_POS     = os.getenv("TOPIC_VEHICLE_POSITIONS", "vehicle-positions")
 WATERMARK_LAG_SEC     = 60
 
-LIB_DIR = Path(__file__).resolve().parents[3] / "lib"
 
-# Only 3 JARs — clean, no Hadoop conflict
-REQUIRED_JARS = [
-    "iceberg-flink-runtime-1.19-1.6.1.jar",
-    "iceberg-aws-bundle-1.6.1.jar",
-    "flink-sql-connector-kafka-3.0.2-1.18.jar",
-    "hadoop-common-3.3.4.jar",
-    "hadoop-hdfs-client-3.3.4.jar",
-    "woodstox-core-5.3.0.jar",
-    "stax2-api-4.2.1.jar",
-    "hadoop-shaded-guava-1.1.1.jar",
-    "hadoop-auth-3.3.4.jar"  # <-- The missing security module!
-]
-
-DOWNLOAD_URLS = {
-    "iceberg-flink-runtime-1.19-1.6.1.jar":
-        "https://repo1.maven.org/maven2/org/apache/iceberg/"
-        "iceberg-flink-runtime-1.19/1.6.1/iceberg-flink-runtime-1.19-1.6.1.jar",
-    "iceberg-aws-bundle-1.6.1.jar":
-        "https://repo1.maven.org/maven2/org/apache/iceberg/"
-        "iceberg-aws-bundle/1.6.1/iceberg-aws-bundle-1.6.1.jar",
-    "hadoop-common-3.3.4.jar":
-        "https://repo1.maven.org/maven2/org/apache/hadoop/"
-        "hadoop-common/3.3.4/hadoop-common-3.3.4.jar",
-    "hadoop-hdfs-client-3.3.4.jar":
-        "https://repo1.maven.org/maven2/org/apache/hadoop/"
-        "hadoop-hdfs-client/3.3.4/hadoop-hdfs-client-3.3.4.jar",
-    "woodstox-core-5.3.0.jar":
-        "https://repo1.maven.org/maven2/com/fasterxml/woodstox/"
-        "woodstox-core/5.3.0/woodstox-core-5.3.0.jar",
-    "stax2-api-4.2.1.jar":
-        "https://repo1.maven.org/maven2/org/codehaus/woodstox/"
-        "stax2-api/4.2.1/stax2-api-4.2.1.jar",
-    "hadoop-shaded-guava-1.1.1.jar":
-        "https://repo1.maven.org/maven2/org/apache/hadoop/"
-        "thirdparty/hadoop-shaded-guava/1.1.1/hadoop-shaded-guava-1.1.1.jar",
-    "hadoop-auth-3.3.4.jar":
-        "https://repo1.maven.org/maven2/org/apache/hadoop/"
-        "hadoop-auth/3.3.4/hadoop-auth-3.3.4.jar"
-}
-
-
-
-# ── SQL that runs INSIDE the Flink container ─────────────────────────────────
 def build_sql() -> str:
     return f"""
 SET 'execution.runtime-mode' = 'streaming';
@@ -89,22 +40,24 @@ SET 'parallelism.default' = '2';
 SET 'execution.checkpointing.interval' = '60000';
 SET 'state.checkpoints.dir' = 'file:///tmp/flink-checkpoints-iceberg';
 
--- S3FileIO (AWS SDK v2) config — uses s3.* prefix, NOT fs.s3a.*
-SET 's3.endpoint' = '{MINIO_ENDPOINT}';
-SET 's3.access-key-id' = '{AWS_ACCESS_KEY_ID}';
-SET 's3.secret-access-key' = '{AWS_SECRET_ACCESS_KEY}';
-SET 's3.path-style-access' = 'true';
+-- S3FileIO properties (AWS SDK v2, no Hadoop needed)
+SET 's3.endpoint'            = '{MINIO_ENDPOINT}';
+SET 's3.access-key-id'       = '{AWS_ACCESS_KEY_ID}';
+SET 's3.secret-access-key'   = '{AWS_SECRET_ACCESS_KEY}';
+SET 's3.path-style-access'   = 'true';
 
--- Create Iceberg catalog with S3FileIO (avoids all Hadoop classpath issues)
+-- Nessie REST catalog: talks HTTP to Nessie container, no Hadoop config class needed
 CREATE CATALOG iceberg_catalog WITH (
-    'type'                   = 'iceberg',
-    'catalog-type'           = 'hadoop',
-    'warehouse'              = '{ICEBERG_WAREHOUSE}',
-    'io-impl'                = 'org.apache.iceberg.aws.s3.S3FileIO',
-    's3.endpoint'            = '{MINIO_ENDPOINT}',
-    's3.access-key-id'       = '{AWS_ACCESS_KEY_ID}',
-    's3.secret-access-key'   = '{AWS_SECRET_ACCESS_KEY}',
-    's3.path-style-access'   = 'true'
+    'type'                      = 'iceberg',
+    'catalog-impl'              = 'org.apache.iceberg.nessie.NessieCatalog',
+    'io-impl'                   = 'org.apache.iceberg.aws.s3.S3FileIO',
+    'uri'                       = '{NESSIE_URI}',
+    'ref'                       = 'main',
+    'warehouse'                 = '{WAREHOUSE}',
+    's3.endpoint'               = '{MINIO_ENDPOINT}',
+    's3.access-key-id'          = '{AWS_ACCESS_KEY_ID}',
+    's3.secret-access-key'      = '{AWS_SECRET_ACCESS_KEY}',
+    's3.path-style-access'      = 'true'
 );
 
 CREATE DATABASE IF NOT EXISTS iceberg_catalog.bronze;
@@ -181,80 +134,63 @@ WHERE vehicle_id IS NOT NULL
 """
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def get_containers(name_filter: str) -> list[str]:
+def get_jobmanager() -> str:
     r = subprocess.run(
-        ["docker", "ps", "--filter", f"name={name_filter}", "--format", "{{.Names}}"],
+        ["docker", "ps", "--filter", "name=flink-jobmanager",
+         "--format", "{{.Names}}"],
         capture_output=True, text=True, check=True,
     )
-    return [c for c in r.stdout.strip().split("\n") if c]
-
-
-def download_missing_jars() -> None:
-    print("\n── Checking JARs ────────────────────────────────────────────")
-    for jar_name in REQUIRED_JARS:
-        jar_path = LIB_DIR / jar_name
-        if jar_path.exists():
-            print(f"  ✅ {jar_name}")
-            continue
-        url = DOWNLOAD_URLS.get(jar_name)
-        if not url:
-            raise FileNotFoundError(
-                f"Missing JAR and no download URL: {jar_path}\n"
-                f"Download manually and place in {LIB_DIR}/"
-            )
-        print(f"  ⬇  Downloading {jar_name}...")
-        subprocess.run(
-            ["wget", "-q", "--show-progress", "-P", str(LIB_DIR), url],
-            check=True,
+    containers = [c for c in r.stdout.strip().split("\n") if c]
+    if not containers:
+        raise RuntimeError(
+            "flink-jobmanager container not running.\n"
+            "Run: docker compose ps  to check status."
         )
-        print(f"  ✅ {jar_name}")
+    return containers[0]
 
 
-def copy_jars(containers: list[str]) -> None:
-    print("\n── Copying JARs into Flink containers ───────────────────────")
-    for jar_name in REQUIRED_JARS:
-        jar_path = LIB_DIR / jar_name
-        for container in containers:
-            subprocess.run(
-                ["docker", "cp", str(jar_path),
-                 f"{container}:/opt/flink/lib/{jar_name}"],
-                check=True, capture_output=True,
-            )
-        print(f"  ✅ {jar_name} → {len(containers)} container(s)")
-
-
-def restart_cluster(containers: list[str], wait_sec: int = 20) -> None:
-    print("\n── Restarting Flink cluster ─────────────────────────────────")
-    # Restart taskmanagers first, then jobmanager
-    tms = [c for c in containers if "taskmanager" in c]
-    jms = [c for c in containers if "jobmanager" in c]
-    for c in tms + jms:
-        subprocess.run(["docker", "restart", c], check=True, capture_output=True)
-        print(f"  Restarted {c}")
-
-    print(f"  Waiting {wait_sec}s...")
-    time.sleep(wait_sec)
-
-    for _ in range(20):
+def wait_for_flink(timeout: int = 60) -> None:
+    print("  Waiting for Flink REST API...", end="", flush=True)
+    for _ in range(timeout // 2):
         try:
             r = requests.get(f"{FLINK_REST_URL}/overview", timeout=3)
             if r.status_code == 200:
                 d = r.json()
-                if d.get("taskmanagers", 0) > 0 and d.get("slots-total", 0) > 0:
-                    print(f"  ✅ Cluster ready — "
-                          f"{d['taskmanagers']} TMs, {d['slots-total']} slots")
+                if d.get("taskmanagers", 0) > 0:
+                    print(f" ready ({d['taskmanagers']} TMs, {d['slots-total']} slots)")
                     return
         except Exception:
             pass
+        print(".", end="", flush=True)
         time.sleep(2)
-    raise RuntimeError("Cluster did not recover. Check: docker compose logs flink-jobmanager")
+    raise RuntimeError(
+        f"\nFlink not reachable at {FLINK_REST_URL} after {timeout}s.\n"
+        "Check: docker compose logs flink-jobmanager --tail=40"
+    )
+
+
+def wait_for_nessie(timeout: int = 30) -> None:
+    print("  Waiting for Nessie catalog...", end="", flush=True)
+    for _ in range(timeout // 2):
+        try:
+            r = requests.get("http://localhost:19120/api/v2/config", timeout=3)
+            if r.status_code == 200:
+                print(" ready")
+                return
+        except Exception:
+            pass
+        print(".", end="", flush=True)
+        time.sleep(2)
+    raise RuntimeError(
+        "Nessie not reachable at localhost:19120.\n"
+        "Check: docker compose logs nessie --tail=20"
+    )
 
 
 def submit_sql(container: str) -> None:
     sql_content = build_sql()
-    local_sql   = "/tmp/transit_iceberg_sink.sql"
-    remote_sql  = "/tmp/transit_iceberg_sink.sql"
+    local_sql   = "/tmp/transit_iceberg_nessie.sql"
+    remote_sql  = "/tmp/transit_iceberg_nessie.sql"
 
     with open(local_sql, "w") as f:
         f.write(sql_content)
@@ -264,88 +200,69 @@ def submit_sql(container: str) -> None:
         check=True,
     )
 
-    print("\n── Running Flink SQL Client inside container ────────────────")
+    print(f"\n── Submitting SQL via Flink SQL Client ──────────────────────")
     result = subprocess.run(
         ["docker", "exec", container,
          "/opt/flink/bin/sql-client.sh", "embedded", "-f", remote_sql],
-        capture_output=True, text=True, timeout=90,
+        capture_output=True, text=True, timeout=120,
     )
 
-    print("\n  ── SQL Client stdout ──")
-    print(result.stdout[-3000:] if result.stdout else "  (empty)")
+    print("\n── SQL Client output ────────────────────────────────────────")
+    if result.stdout:
+        print(result.stdout[-3000:])
 
-    if result.stderr:
-        error_lines = [
-            l for l in result.stderr.split("\n")
-            if any(k in l for k in ["ERROR", "Exception", "FAILED"])
-        ]
-        if error_lines:
-            print("\n  ── Errors ──")
-            print("\n".join(error_lines))
-            raise RuntimeError("SQL execution failed — see errors above")
+    errors = [
+        l for l in (result.stderr or "").split("\n")
+        if any(k in l for k in ["ERROR", "Exception", "FAILED", "ClassNotFound"])
+    ]
+    if errors:
+        print("\n── Errors ───────────────────────────────────────────────────")
+        print("\n".join(errors))
+        raise RuntimeError("SQL submission failed — see errors above")
 
-    print("\n  SQL Client finished.")
+    print("  SQL Client completed.")
 
 
-def verify_jobs() -> None:
-    print("\n── Job status ───────────────────────────────────────────────")
+def check_jobs() -> None:
+    print("\n── Running jobs ─────────────────────────────────────────────")
     time.sleep(6)
     try:
         jobs = requests.get(
             f"{FLINK_REST_URL}/jobs/overview", timeout=5
         ).json().get("jobs", [])
         if not jobs:
-            print("  No jobs yet — INSERT may still be initialising")
-            print(f"  Check: {FLINK_REST_URL}/#/overview in ~10s")
+            print("  No jobs yet — may still be starting (~10s)")
+            print(f"  Check: {FLINK_REST_URL}/#/overview")
             return
         for job in jobs:
             state = job.get("state", "?")
             jid   = job.get("jid", "")
             print(f"  [{state}] {jid[:8]}...")
             if state == "RUNNING":
-                print(f"\n  ✅ Iceberg sink is RUNNING")
-                print(f"  Flink UI : {FLINK_REST_URL}/#/job/{jid}/overview")
-                print(f"  MinIO    : http://localhost:9001")
-                print(f"  Files    : transit-twin-local/lakehouse/bronze/vehicle_positions_raw/")
-                print(f"  (Parquet files appear after first 60s checkpoint)")
+                print(f"\n  ✅ Iceberg sink RUNNING!")
+                print(f"  Flink   : {FLINK_REST_URL}/#/job/{jid}/overview")
+                print(f"  MinIO   : http://localhost:9001")
+                print(f"  Nessie  : http://localhost:19120")
+                print(f"  Parquet files appear after first checkpoint (~60s)")
             elif state == "FAILED":
-                print(f"\n  ❌ Job FAILED")
-                print(f"  Details: {FLINK_REST_URL}/#/job/{jid}/exceptions")
+                print(f"  ❌ FAILED — {FLINK_REST_URL}/#/job/{jid}/exceptions")
     except Exception as exc:
-        print(f"  Could not query jobs: {exc}")
+        print(f"  Could not query: {exc}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     print("=" * 60)
-    print("  Flink → Iceberg Bronze Sink  (AWS SDK v2 / S3FileIO)")
+    print("  Flink → Iceberg  (Nessie catalog + S3FileIO)")
     print("=" * 60)
-    print(f"\n  Warehouse : {ICEBERG_WAREHOUSE}")
-    print(f"  Kafka     : {FLINK_KAFKA_BOOTSTRAP}")
-    print(f"  MinIO     : {MINIO_ENDPOINT}")
-    print(f"  Strategy  : S3FileIO (no hadoop-aws, no classpath conflicts)")
 
-    # Verify Flink REST is reachable
-    try:
-        d = requests.get(f"{FLINK_REST_URL}/overview", timeout=5).json()
-        print(f"\n  Flink {d.get('flink-version')} | "
-              f"{d.get('taskmanagers')} TMs | {d.get('slots-total')} slots")
-    except Exception:
-        raise RuntimeError(
-            f"Flink not reachable at {FLINK_REST_URL}\n"
-            "Run: make up  and wait 30s"
-        )
+    wait_for_flink()
+    wait_for_nessie()
 
-    jm = get_containers("flink-jobmanager")
-    tm = get_containers("flink-taskmanager")
-    if not jm:
-        raise RuntimeError("No flink-jobmanager container running")
+    container = get_jobmanager()
+    print(f"\n  JobManager: {container}")
 
-    download_missing_jars()
-    copy_jars(jm + tm)
-    restart_cluster(jm + tm, wait_sec=20)
-    submit_sql(jm[0])
-    verify_jobs()
+    submit_sql(container)
+    check_jobs()
 
 
 if __name__ == "__main__":
