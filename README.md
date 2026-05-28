@@ -122,9 +122,9 @@ uvicorn serving_layer.api.main:app --reload --port 8000
 ## Roadmap
 
 - [x] Project scaffold and infrastructure provisioning
-- [ ] GTFS-RT Kafka producer (BMTC + Metro)
-- [ ] Flink delay detection job
-- [ ] Iceberg lakehouse with dbt Medallion models
+- [x] GTFS-RT Kafka producer (BMTC + Metro)
+- [x] Flink delay detection job
+- [x] Iceberg lakehouse with dbt Medallion models
 - [ ] LSTM ETA prediction model (Ray Train + MLflow)
 - [ ] FastAPI + WebSocket serving layer
 - [ ] Blender city asset pipeline
