@@ -1,0 +1,38 @@
+# data_engineering/dbt/dbt_project.yml
+# ─────────────────────────────────────────────────────────────────────────────
+#  dbt project configuration for Bangalore Transit Digital Twin
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: bangalore_transit_twin
+version: "1.0.0"
+config-version: 2
+
+# Must match the key in profiles.yml
+profile: bangalore_transit_twin
+
+# Directory layout
+model-paths:      ["models"]
+test-paths:       ["tests"]
+macro-paths:      ["macros"]
+analysis-paths:   ["analyses"]
+snapshot-paths:   ["snapshots"]
+seed-paths:       ["seeds"]
+
+target-path:  "target"
+clean-targets: ["target", "dbt_packages"]
+
+# Model materialization defaults per layer
+models:
+  bangalore_transit_twin:
+    silver:
+      +materialized: table
+      +schema: silver
+      +tags: ["silver"]
+    gold:
+      +materialized: table
+      +schema: gold
+      +tags: ["gold"]
+
+# DuckDB writes these as schemas inside transit_twin.duckdb
+# silver models → transit_twin.silver.*
+# gold models   → transit_twin.gold.*

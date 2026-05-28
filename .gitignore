@@ -73,3 +73,13 @@ data/
 # ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 logs/
+
+# dbt outputs and configs
+data_engineering/dbt/target/
+data_engineering/dbt/logs/
+data_engineering/dbt/dbt_packages/
+data_engineering/dbt/.user.yml
+
+# DuckDB local database files
+*.duckdb
+*.duckdb.wal

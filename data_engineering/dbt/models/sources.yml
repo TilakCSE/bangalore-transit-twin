@@ -1,0 +1,35 @@
+# data_engineering/dbt/models/sources.yml
+# Declares Bronze Parquet files on MinIO as dbt sources.
+# DuckDB reads these directly via read_parquet() — no catalog needed.
+
+version: 2
+
+sources:
+  - name: bronze
+    description: "Raw Iceberg Parquet files on MinIO — written by Flink sink"
+    meta:
+      warehouse: "s3://transit-twin-local/lakehouse/bronze"
+    tables:
+      - name: vehicle_positions_raw
+        description: "Live vehicle positions from BMTC and Namma Metro GTFS-RT feeds"
+        meta:
+          parquet_glob: "s3://transit-twin-local/lakehouse/bronze/vehicle_positions_raw/**/*.parquet"
+        columns:
+          - name: vehicle_id
+            description: "Unique vehicle identifier from the feed"
+          - name: route_id
+            description: "Route the vehicle is currently serving"
+          - name: feed
+            description: "Data source: bmtc or namma_metro"
+          - name: latitude
+            tests:
+              - not_null
+          - name: longitude
+            tests:
+              - not_null
+          - name: event_ts
+            description: "Event timestamp from the GTFS-RT feed"
+            tests:
+              - not_null
+          - name: ingestion_date
+            description: "Partition key — date the record was ingested"

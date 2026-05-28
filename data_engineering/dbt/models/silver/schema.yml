@@ -1,0 +1,42 @@
+# models/silver/schema.yml
+version: 2
+
+models:
+  - name: silver_vehicle_positions
+    description: "Cleaned, deduplicated, enriched vehicle positions from Bronze layer"
+    columns:
+      - name: vehicle_id
+        tests:
+          - not_null
+      - name: latitude
+        tests:
+          - not_null
+      - name: longitude
+        tests:
+          - not_null
+      - name: feed
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['bmtc', 'namma_metro']
+      - name: speed_category
+        tests:
+          - accepted_values:
+              values: ['STATIONARY', 'SLOW', 'NORMAL', 'FAST']
+      - name: time_bucket
+        tests:
+          - accepted_values:
+              values: ['AM_PEAK', 'PM_PEAK', 'NIGHT', 'EARLY_MORNING', 'OFFPEAK']
+
+  - name: gold_route_performance_daily
+    description: "Daily route KPIs — speed, reliability, congestion indicators"
+    columns:
+      - name: route_id
+        tests:
+          - not_null
+      - name: feed
+        tests:
+          - not_null
+      - name: reliability_score
+        tests:
+          - not_null

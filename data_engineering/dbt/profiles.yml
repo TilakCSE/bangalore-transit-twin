@@ -1,0 +1,21 @@
+# ~/.dbt/profiles.yml
+# OR place at data_engineering/dbt/profiles.yml and run with --profiles-dir
+#
+# DuckDB reads Parquet files directly from MinIO via httpfs.
+# No Spark, no warehouse needed — runs entirely locally.
+
+bangalore_transit_twin:
+  target: local
+  outputs:
+    local:
+      type: duckdb
+      path: "/home/tilakchauhan/projects/bangalore-transit-twin/data_engineering/dbt/transit_twin.duckdb"
+      threads: 4
+      extensions:
+        - httpfs
+      settings:
+        s3_endpoint: "localhost:9000"
+        s3_access_key_id: "minioadmin"
+        s3_secret_access_key: "minioadmin"
+        s3_use_ssl: false
+        s3_url_style: "path"
