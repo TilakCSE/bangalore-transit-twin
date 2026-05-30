@@ -1,236 +1,247 @@
 """
-ETA Prediction Model — Training Pipeline
+LSTM Speed/ETA Prediction Model — Training Pipeline
 ─────────────────────────────────────────────────────────────────────────────
-Trains an LSTM / Temporal Convolutional Network ensemble to predict
-Estimated Time of Arrival (ETA) for BMTC bus stops.
+Trains an LSTM on the feature store built by feature_engineering.py.
+Uses your RTX 3050 GPU via CUDA.
+Tracked by MLflow — view at http://localhost:5000
 
-Architecture:
-  - Input: sequence of (delay, speed, stop_sequence, hour, day_of_week,
-           weather_condition) over the last N stops
-  - Output: predicted arrival delay at the next K stops (multi-step)
-  - Training: Ray Train distributed (data-parallel across 2–4 GPUs/CPUs)
-  - Tracking: MLflow experiment logging + model registration
-  - Data: Silver Iceberg table `silver.stop_time_actuals`
-
-Run locally (single node):
-    python -m mlops_pipeline.training.train_eta_model --local
-
-Run on Ray cluster:
-    python -m mlops_pipeline.training.train_eta_model --ray-address auto
+Run:
+    python3 -m mlops_pipeline.training.train_eta_model
 """
 
 from __future__ import annotations
 
-import argparse
+import json
 import os
 import time
-from typing import Any
+from pathlib import Path
 
 import mlflow
 import mlflow.pytorch
 import numpy as np
 import torch
 import torch.nn as nn
-from dotenv import load_dotenv
 from torch.utils.data import DataLoader, Dataset, random_split
 
-load_dotenv()
+FEATURE_STORE  = Path("mlops_pipeline/features/feature_store.parquet")
+SCALER_PARAMS  = Path("mlops_pipeline/features/scaler_params.json")
+MODEL_OUTPUT   = Path("mlops_pipeline/registry/best_eta_model.pt")
+MLFLOW_URI     = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+EXPERIMENT     = "bangalore-transit-eta"
 
-# ── Hyperparameters (overridden by Ray Tune in sweep mode) ───────────────────
-DEFAULT_CONFIG: dict[str, Any] = {
-    "seq_len": 10,          # lookback: number of past stops
-    "pred_len": 3,          # predict arrival delay for next 3 stops
-    "input_dim": 8,         # features per timestep
-    "hidden_dim": 128,
-    "num_layers": 2,
-    "dropout": 0.2,
-    "lr": 1e-3,
-    "batch_size": 256,
-    "epochs": 50,
-    "early_stop_patience": 7,
+CONFIG = {
+    "seq_len":      7,
+    "input_dim":    17,    # must match feature_engineering output
+    "hidden_dim":   128,
+    "num_layers":   2,
+    "dropout":      0.2,
+    "lr":           1e-3,
+    "batch_size":   64,
+    "epochs":       100,
+    "patience":     12,
+    "val_split":    0.15,
 }
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
-class GTFSSequenceDataset(Dataset):
-    """
-    Loads pre-computed feature sequences from the Silver Iceberg table.
-    Falls back to synthetic data when Iceberg is unavailable (local dev).
-    Each sample: (X [seq_len, input_dim], y [pred_len]) — delay in seconds.
-    """
+class TransitDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).float()
 
-    def __init__(
-        self,
-        seq_len: int = 10,
-        pred_len: int = 3,
-        input_dim: int = 8,
-        use_synthetic: bool = False,
-        n_samples: int = 50_000,
-    ) -> None:
-        self.seq_len   = seq_len
-        self.pred_len  = pred_len
-        self.input_dim = input_dim
-
-        if use_synthetic:
-            self.X, self.y = self._generate_synthetic(n_samples)
-        else:
-            self.X, self.y = self._load_from_iceberg()
-
-    def _load_from_iceberg(self):
-        """Load feature sequences from Silver Iceberg table on GCS."""
-        try:
-            from pyiceberg.catalog import load_catalog
-            catalog = load_catalog("gcs_catalog", **{
-                "type": "rest",
-                "uri": os.getenv("ICEBERG_CATALOG_URI", "http://localhost:8181"),
-                "warehouse": f"gs://{os.getenv('GCS_BUCKET', 'transit-twin-local')}/lakehouse",
-            })
-            table = catalog.load_table("silver.eta_feature_sequences")
-            df = table.scan().to_pandas()
-            X = df[[f"feat_{i}" for i in range(self.seq_len * self.input_dim)]].values
-            X = X.reshape(-1, self.seq_len, self.input_dim).astype(np.float32)
-            y = df[[f"target_{i}" for i in range(self.pred_len)]].values.astype(np.float32)
-            return torch.from_numpy(X), torch.from_numpy(y)
-        except Exception as exc:
-            print(f"[WARN] Iceberg unavailable ({exc}), falling back to synthetic data")
-            return self._generate_synthetic(50_000)
-
-    def _generate_synthetic(self, n: int):
-        """
-        Synthetic ETA data for local development / CI.
-        Models: delay ~ AR(1) process + rush-hour spike + noise
-        """
-        rng = np.random.default_rng(42)
-        # Feature order: delay_sec, speed_mps, stop_seq_norm, hour_sin, hour_cos,
-        #                day_of_week_sin, day_of_week_cos, weather_severity
-        X = rng.normal(0, 1, (n, self.seq_len, self.input_dim)).astype(np.float32)
-        # Target: mean of future delays with some autocorrelation from last input
-        base_delay = X[:, -1, 0] * 60   # last seen delay scaled to seconds
-        y = np.stack([
-            base_delay + rng.normal(0, 30, n),
-            base_delay * 0.8 + rng.normal(0, 40, n),
-            base_delay * 0.6 + rng.normal(0, 50, n),
-        ], axis=1).astype(np.float32)
-        return torch.from_numpy(X), torch.from_numpy(y)
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.X)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
 
-# ── Model architecture ────────────────────────────────────────────────────────
-class ETALSTMModel(nn.Module):
-    """
-    Stacked LSTM with residual connection and multi-step output head.
-    Architecture chosen for balance of accuracy and inference latency (<5ms on CPU).
-    """
+def load_features():
+    import pandas as pd
+    if not FEATURE_STORE.exists():
+        raise FileNotFoundError(
+            f"Feature store not found: {FEATURE_STORE}\n"
+            "Run first: python3 -m mlops_pipeline.features.feature_engineering"
+        )
+    with open(SCALER_PARAMS) as f:
+        scaler = json.load(f)
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    meta_df  = pd.read_parquet(FEATURE_STORE)
+    seq_len  = scaler["seq_len"]
+    n_feats  = len(scaler["feature_cols"])
+    n        = len(meta_df)
+
+    # Rebuild X from the scaled target (meta only stores targets + metadata)
+    # For real sequences we need to reload from Gold — use synthetic augmentation
+    # if we have < 100 samples (early pipeline stage)
+    y = meta_df["target_speed_kmh"].values.astype(np.float32)
+
+    if n < 50:
+        print(f"⚠️  Only {n} real samples — augmenting with synthetic data for training")
+        print("   As more days accumulate, rerun feature_engineering.py for real data")
+        X, y = _synthetic_sequences(n_samples=2000, seq_len=seq_len, n_feats=n_feats)
+    else:
+        # Reconstruct sequences — X was normalized and stored in feature store
+        # For now reconstruct from available targets with lag features
+        X = _reconstruct_sequences(meta_df, seq_len, n_feats)
+
+    return X, y, scaler
+
+
+def _synthetic_sequences(n_samples, seq_len, n_feats):
+    """
+    Realistic synthetic sequences based on Indian transit speed distributions.
+    Used when real data is still accumulating.
+    """
+    rng = np.random.default_rng(42)
+    # Simulate speed sequences: Bangalore buses avg 15-25 km/h
+    base_speeds = rng.uniform(10, 35, n_samples)
+    X = np.zeros((n_samples, seq_len, n_feats), dtype=np.float32)
+    for i in range(n_samples):
+        for t in range(seq_len):
+            noise = rng.normal(0, 0.05)
+            X[i, t, 0] = np.clip(base_speeds[i] / 60 + noise, 0, 1)  # speed normalized
+            X[i, t, 1] = np.clip(base_speeds[i] * 0.8 / 60 + noise, 0, 1)  # am peak
+            X[i, t, 2] = np.clip(base_speeds[i] * 0.7 / 60 + noise, 0, 1)  # pm peak
+            X[i, t, 6] = X[i, max(0, t-1), 0]  # lag_1
+            X[i, t, 13] = rng.integers(0, 2)   # is_weekend
+        # target: next day speed (slight regression to mean)
+    y = (base_speeds * 0.9 + rng.normal(0, 2, n_samples)).clip(5, 60).astype(np.float32)
+    y = (y - y.min()) / (y.max() - y.min() + 1e-8)
+    return X, y
+
+
+def _reconstruct_sequences(meta_df, seq_len, n_feats):
+    """Build feature matrix from available metadata columns."""
+    n = len(meta_df)
+    X = np.zeros((n, seq_len, n_feats), dtype=np.float32)
+    targets = meta_df["target_speed_kmh"].values
+    for i in range(n):
+        for t in range(seq_len):
+            lag = max(0, i - (seq_len - t))
+            X[i, t, 0] = targets[lag]                    # speed
+            X[i, t, 13] = 1 if t % 7 >= 5 else 0        # weekend approx
+    return X
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+class ETALSTMModel(nn.Module):
+    def __init__(self, cfg):
         super().__init__()
         self.lstm = nn.LSTM(
-            input_size=config["input_dim"],
-            hidden_size=config["hidden_dim"],
-            num_layers=config["num_layers"],
-            dropout=config["dropout"] if config["num_layers"] > 1 else 0.0,
+            input_size=cfg["input_dim"],
+            hidden_size=cfg["hidden_dim"],
+            num_layers=cfg["num_layers"],
+            dropout=cfg["dropout"] if cfg["num_layers"] > 1 else 0.0,
             batch_first=True,
         )
-        self.layer_norm = nn.LayerNorm(config["hidden_dim"])
-        self.dropout    = nn.Dropout(config["dropout"])
-        self.output_head = nn.Sequential(
-            nn.Linear(config["hidden_dim"], config["hidden_dim"] // 2),
+        self.norm   = nn.LayerNorm(cfg["hidden_dim"])
+        self.drop   = nn.Dropout(cfg["dropout"])
+        self.head   = nn.Sequential(
+            nn.Linear(cfg["hidden_dim"], cfg["hidden_dim"] // 2),
             nn.GELU(),
-            nn.Linear(config["hidden_dim"] // 2, config["pred_len"]),
+            nn.Dropout(cfg["dropout"]),
+            nn.Linear(cfg["hidden_dim"] // 2, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lstm_out, _ = self.lstm(x)           # [B, seq_len, hidden]
-        last         = lstm_out[:, -1, :]    # take last timestep
-        last         = self.layer_norm(last)
-        last         = self.dropout(last)
-        return self.output_head(last)        # [B, pred_len]
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last   = self.norm(out[:, -1, :])
+        last   = self.drop(last)
+        return self.head(last).squeeze(-1)
 
 
-# ── Training loop ─────────────────────────────────────────────────────────────
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
+# ── Training ──────────────────────────────────────────────────────────────────
+def train_epoch(model, loader, opt, criterion, device, scaler_amp):
     model.train()
-    total_loss = 0.0
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
-        preds = model(X_batch)
-        loss  = criterion(preds, y_batch)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        total_loss += loss.item() * len(X_batch)
-    return total_loss / len(loader.dataset)
+    total = 0.0
+    for X_b, y_b in loader:
+        X_b, y_b = X_b.to(device), y_b.to(device)
+        opt.zero_grad()
+        with torch.amp.autocast("cuda", enabled=scaler_amp is not None):
+            pred = model(X_b)
+            loss = criterion(pred, y_b)
+        if scaler_amp:
+            scaler_amp.scale(loss).backward()
+            scaler_amp.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler_amp.step(opt)
+            scaler_amp.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        total += loss.item() * len(X_b)
+    return total / len(loader.dataset)
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> dict[str, float]:
+def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss, total_mae = 0.0, 0.0
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        preds = model(X_batch)
-        total_loss += criterion(preds, y_batch).item() * len(X_batch)
-        total_mae  += (preds - y_batch).abs().mean().item() * len(X_batch)
+    mse, mae = 0.0, 0.0
+    for X_b, y_b in loader:
+        X_b, y_b = X_b.to(device), y_b.to(device)
+        pred = model(X_b)
+        mse += criterion(pred, y_b).item() * len(X_b)
+        mae += (pred - y_b).abs().mean().item() * len(X_b)
     n = len(loader.dataset)
-    return {"val_rmse": (total_loss / n) ** 0.5, "val_mae": total_mae / n}
+    return {"val_rmse": (mse / n) ** 0.5, "val_mae": mae / n}
 
 
-def train(config: dict[str, Any], use_synthetic: bool = True) -> None:
-    """Full training run — called directly or via Ray Train worker."""
-    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
-    mlflow.set_experiment(os.getenv("MLFLOW_EXPERIMENT_NAME", "bangalore-transit-eta"))
-
+def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[TRAIN] Using device: {device}")
+    use_amp = device.type == "cuda"
+    print(f"\n  Device : {device}")
+    if device.type == "cuda":
+        print(f"  GPU    : {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM   : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    # ── Data ──────────────────────────────────────────────────────────────────
-    dataset = GTFSSequenceDataset(
-        seq_len=config["seq_len"],
-        pred_len=config["pred_len"],
-        input_dim=config["input_dim"],
-        use_synthetic=use_synthetic,
-    )
-    n_val   = int(len(dataset) * 0.15)
-    n_train = len(dataset) - n_val
+    X, y, scaler = load_features()
+    # Update config input_dim from actual data
+    CONFIG["input_dim"]  = X.shape[2]
+    CONFIG["seq_len"]    = X.shape[1]
+
+    print(f"  Samples: {len(X):,}  |  Features: {X.shape[2]}  |  Seq len: {X.shape[1]}")
+
+    dataset  = TransitDataset(X, y)
+    n_val    = max(1, int(len(dataset) * CONFIG["val_split"]))
+    n_train  = len(dataset) - n_val
     train_ds, val_ds = random_split(dataset, [n_train, n_val])
 
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True,  num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=config["batch_size"], shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=CONFIG["batch_size"],
+                              shuffle=True, num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=CONFIG["batch_size"],
+                              shuffle=False, num_workers=2, pin_memory=True)
 
-    # ── Model ──────────────────────────────────────────────────────────────────
-    model     = ETALSTMModel(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
+    model     = ETALSTMModel(CONFIG).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                  lr=CONFIG["lr"], weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=CONFIG["epochs"])
     criterion = nn.MSELoss()
+    amp_scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
-    best_val_rmse  = float("inf")
-    patience_count = 0
+    mlflow.set_tracking_uri(MLFLOW_URI)
+    mlflow.set_experiment(EXPERIMENT)
 
-    with mlflow.start_run():
-        mlflow.log_params(config)
+    best_rmse, patience_count = float("inf"), 0
+
+    with mlflow.start_run(run_name="lstm-transit-eta"):
+        mlflow.log_params(CONFIG)
         mlflow.log_param("device", str(device))
         mlflow.log_param("train_samples", n_train)
+        mlflow.log_param("val_samples", n_val)
 
-        for epoch in range(1, config["epochs"] + 1):
-            t0         = time.time()
-            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        print(f"\n{'─'*55}")
+        print(f"  Training LSTM — {CONFIG['epochs']} epochs max")
+        print(f"  Early stop patience: {CONFIG['patience']}")
+        print(f"{'─'*55}")
+
+        for epoch in range(1, CONFIG["epochs"] + 1):
+            t0 = time.time()
+            train_loss = train_epoch(
+                model, train_loader, optimizer, criterion, device, amp_scaler
+            )
             val_metrics = evaluate(model, val_loader, criterion, device)
             scheduler.step()
 
@@ -240,60 +251,50 @@ def train(config: dict[str, Any], use_synthetic: bool = True) -> None:
                 "lr": scheduler.get_last_lr()[0],
             }, step=epoch)
 
-            print(
-                f"Epoch {epoch:03d} | "
-                f"train_rmse={train_loss**0.5:.2f}s | "
-                f"val_rmse={val_metrics['val_rmse']:.2f}s | "
-                f"val_mae={val_metrics['val_mae']:.2f}s | "
-                f"time={time.time()-t0:.1f}s"
-            )
+            if epoch % 5 == 0 or epoch == 1:
+                print(
+                    f"  Epoch {epoch:03d} | "
+                    f"train_rmse={train_loss**0.5:.4f} | "
+                    f"val_rmse={val_metrics['val_rmse']:.4f} | "
+                    f"val_mae={val_metrics['val_mae']:.4f} | "
+                    f"{time.time()-t0:.1f}s"
+                )
 
-            if val_metrics["val_rmse"] < best_val_rmse:
-                best_val_rmse = val_metrics["val_rmse"]
+            if val_metrics["val_rmse"] < best_rmse:
+                best_rmse = val_metrics["val_rmse"]
                 patience_count = 0
-                # Save best checkpoint
-                torch.save(model.state_dict(), "/tmp/best_eta_model.pt")
-                mlflow.log_artifact("/tmp/best_eta_model.pt", artifact_path="checkpoints")
+                MODEL_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "model_state": model.state_dict(),
+                    "config": CONFIG,
+                    "scaler": scaler,
+                    "best_val_rmse": best_rmse,
+                    "epoch": epoch,
+                }, MODEL_OUTPUT)
             else:
                 patience_count += 1
-                if patience_count >= config["early_stop_patience"]:
-                    print(f"Early stopping at epoch {epoch}")
+                if patience_count >= CONFIG["patience"]:
+                    print(f"\n  Early stop at epoch {epoch}")
                     break
 
-        # Register best model to MLflow Model Registry
-        model.load_state_dict(torch.load("/tmp/best_eta_model.pt"))
+        # Register in MLflow Model Registry
+        checkpoint = torch.load(MODEL_OUTPUT, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
         mlflow.pytorch.log_model(
             model,
-            artifact_path="eta_model",
-            registered_model_name="bangalore-transit-eta",
+            artifact_path="eta_lstm",
+            registered_model_name="bangalore-transit-eta-lstm",
         )
-        mlflow.log_metric("best_val_rmse", best_val_rmse)
-        print(f"\n✅ Training complete. Best val_rmse: {best_val_rmse:.2f}s")
+        mlflow.log_metric("best_val_rmse", best_rmse)
+        mlflow.log_artifact(str(MODEL_OUTPUT))
+
+        print(f"\n{'='*55}")
+        print(f"  ✅ Training complete!")
+        print(f"  Best val RMSE : {best_rmse:.4f}")
+        print(f"  Model saved   : {MODEL_OUTPUT}")
+        print(f"  MLflow UI     : {MLFLOW_URI}")
+        print(f"{'='*55}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--local", action="store_true", help="Run single-node (no Ray)")
-    parser.add_argument("--synthetic", action="store_true", default=True)
-    args = parser.parse_args()
-
-    if args.local:
-        train(DEFAULT_CONFIG, use_synthetic=args.synthetic)
-    else:
-        import ray
-        from ray import train as ray_train
-        from ray.train.torch import TorchTrainer
-        from ray.train import ScalingConfig
-
-        ray.init(address="auto")
-
-        def ray_train_fn(config):
-            train(config, use_synthetic=args.synthetic)
-
-        trainer = TorchTrainer(
-            ray_train_fn,
-            train_loop_config=DEFAULT_CONFIG,
-            scaling_config=ScalingConfig(num_workers=2, use_gpu=torch.cuda.is_available()),
-        )
-        result = trainer.fit()
-        print(result)
+    train()
