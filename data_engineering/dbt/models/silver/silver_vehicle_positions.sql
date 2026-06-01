@@ -57,8 +57,18 @@ cleaned AS (
         COALESCE(speed_mps, 0.0)            AS speed_mps,
         current_status,
         feed,
-        event_ts,
-        ingestion_date,
+        
+        -- THE RESCUE OPERATION: Fallback to ingested_at if event_ts is 1970
+        CASE 
+            WHEN YEAR(event_ts) = 1970 THEN to_timestamp(ingested_at) 
+            ELSE event_ts 
+        END AS event_ts,
+        
+        CASE 
+            WHEN YEAR(event_ts) = 1970 THEN CAST(to_timestamp(ingested_at) AS DATE) 
+            ELSE ingestion_date 
+        END AS ingestion_date,
+        
         ingested_at,
 
         -- ── Speed classification ────────────────────────────────────────────
@@ -66,7 +76,7 @@ cleaned AS (
             WHEN COALESCE(speed_mps, 0) < 0.5  THEN 'STATIONARY'
             WHEN COALESCE(speed_mps, 0) < 5.0  THEN 'SLOW'
             WHEN COALESCE(speed_mps, 0) < 15.0 THEN 'NORMAL'
-            ELSE                                     'FAST'
+            ELSE                                    'FAST'
         END                                         AS speed_category,
 
         -- ── Time features (for ML feature store) ───────────────────────────
