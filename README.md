@@ -1,7 +1,7 @@
 # Bangalore Transit Digital Twin
 ### Real-time 3D Smart City Platform — Applied AI & Data Architecture Portfolio
 
-[![CI/CD](https://github.com/yourusername/bangalore-transit-twin/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/bangalore-transit-twin/actions)
+[![CI/CD](https://github.com/TilakCSE/bangalore-transit-twin/actions/workflows/ci.yml/badge.svg)](https://github.com/TilakCSE/bangalore-transit-twin/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Unity 6](https://img.shields.io/badge/Unity-6_HDRP-black.svg)](https://unity.com/)
