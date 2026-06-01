@@ -1,20 +1,18 @@
 """
-Feature Engineering Pipeline
+Feature Engineering Pipeline v2
 ─────────────────────────────────────────────────────────────────────────────
-Reads the Gold DuckDB table and builds supervised learning sequences
-for the LSTM ETA / speed prediction model.
+Strategy: date-level aggregation instead of route-level sequences.
 
-Input:  data_engineering/dbt/transit_twin.duckdb → gold.gold_route_performance_daily
-Output: mlops_pipeline/features/feature_store.parquet
+With sparse multi-day data (routes don't appear every day), route-level
+lag features drop almost everything. Instead we aggregate to daily
+network-level stats and build cross-route features per day.
 
-Feature set per route per day:
-  - avg_speed_kmh (target for next-day prediction)
-  - stationary_pct, slow_pct (congestion signals)
-  - avg_speed_am_peak_kmh, avg_speed_pm_peak_kmh
-  - reliability_score
-  - day_of_week (0-6), is_weekend
-  - lag_1_speed, lag_2_speed, lag_3_speed (autoregressive features)
-  - rolling_7d_speed (trend)
+This produces a rich, trainable dataset from just 3 days of data:
+  - 1,550 routes × 3 days = 4,650 route-day samples
+  - Each sample: route features for one day → predict speed
+  - No lag requirement: each route-day is an independent sample
+
+For production (30+ days): the sequence model kicks in automatically.
 
 Run:
     python3 -m mlops_pipeline.features.feature_engineering
@@ -22,6 +20,7 @@ Run:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -30,16 +29,16 @@ import pandas as pd
 
 DBT_DB_PATH    = Path("data_engineering/dbt/transit_twin.duckdb")
 FEATURE_OUTPUT = Path("mlops_pipeline/features/feature_store.parquet")
-SEQ_LEN        = 7   # use 7 days of history to predict the next day
-TARGET_COL     = "avg_speed_kmh"
+SEQ_LEN        = 7    # used when enough days exist
+MIN_DAYS_FOR_SEQUENCES = 14  # switch to sequence mode after 2 weeks
 
 
 def load_gold_table() -> pd.DataFrame:
     import duckdb
     if not DBT_DB_PATH.exists():
         raise FileNotFoundError(
-            f"DuckDB file not found: {DBT_DB_PATH}\n"
-            "Run dbt first: cd data_engineering/dbt && dbt run --profiles-dir ."
+            f"DuckDB not found: {DBT_DB_PATH}\n"
+            "Run: cd data_engineering/dbt && dbt run --profiles-dir ."
         )
     conn = duckdb.connect(str(DBT_DB_PATH), read_only=True)
     df = conn.execute("""
@@ -48,179 +47,183 @@ def load_gold_table() -> pd.DataFrame:
             feed,
             ingestion_date,
             avg_speed_kmh,
-            avg_speed_am_peak_kmh,
-            avg_speed_pm_peak_kmh,
-            stationary_pct,
-            slow_pct,
-            reliability_score,
+            COALESCE(avg_speed_am_peak_kmh, avg_speed_kmh) AS avg_speed_am_peak_kmh,
+            COALESCE(avg_speed_pm_peak_kmh, avg_speed_kmh) AS avg_speed_pm_peak_kmh,
+            COALESCE(stationary_pct, 0)   AS stationary_pct,
+            COALESCE(slow_pct, 0)         AS slow_pct,
+            COALESCE(reliability_score, 50) AS reliability_score,
             unique_vehicles,
             total_observations
         FROM main_gold.gold_route_performance_daily
         WHERE avg_speed_kmh IS NOT NULL
-          AND route_id != 'UNKNOWN'
         ORDER BY route_id, feed, ingestion_date
     """).df()
     conn.close()
-    print(f"Loaded {len(df):,} rows from Gold table")
-    print(f"Feeds: {df['feed'].unique()}")
-    print(f"Date range: {df['ingestion_date'].min()} → {df['ingestion_date'].max()}")
-    print(f"Unique routes: {df['route_id'].nunique()}")
+
+    df["ingestion_date"] = pd.to_datetime(df["ingestion_date"])
+    unique_dates = sorted(df["ingestion_date"].unique())
+
+    print(f"  Rows loaded    : {len(df):,}")
+    print(f"  Feeds          : {df['feed'].unique().tolist()}")
+    print(f"  Date range     : {df['ingestion_date'].min().date()} → {df['ingestion_date'].max().date()}")
+    print(f"  Unique dates   : {len(unique_dates)}")
+    print(f"  Unique routes  : {df['route_id'].nunique():,}")
     return df
 
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_cross_sectional_features(df: pd.DataFrame):
+    """
+    Build one feature vector per (route, day).
+    No lag requirement — works with any number of days.
+
+    Features:
+      - Route-level: speed stats, congestion, reliability
+      - Network-level: daily averages (how does this route compare to network?)
+      - Time: day of week, is_weekend encoded cyclically
+      - Feed: encoded
+    """
     df = df.copy()
-    df["ingestion_date"] = pd.to_datetime(df["ingestion_date"])
-    df = df.sort_values(["route_id", "feed", "ingestion_date"])
 
-    # Fill nulls in optional columns
-    for col in ["avg_speed_am_peak_kmh", "avg_speed_pm_peak_kmh",
-                "stationary_pct", "slow_pct", "reliability_score"]:
-        df[col] = df[col].fillna(df[col].median())
+    # ── Network-level daily stats (context for each route) ────────────────────
+    daily_network = df.groupby(["feed", "ingestion_date"]).agg(
+        network_avg_speed    = ("avg_speed_kmh",    "mean"),
+        network_med_speed    = ("avg_speed_kmh",    "median"),
+        network_avg_reliable = ("reliability_score","mean"),
+        network_total_routes = ("route_id",         "count"),
+        network_stationary   = ("stationary_pct",   "mean"),
+    ).reset_index()
 
-    # Time features
-    df["day_of_week"] = df["ingestion_date"].dt.dayofweek   # 0=Monday
-    df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
+    df = df.merge(daily_network, on=["feed", "ingestion_date"], how="left")
+
+    # ── Route relative to network ─────────────────────────────────────────────
+    df["speed_vs_network"]    = df["avg_speed_kmh"] / (df["network_avg_speed"] + 1e-6)
+    df["reliable_vs_network"] = df["reliability_score"] / (df["network_avg_reliable"] + 1e-6)
+
+    # ── Time features ─────────────────────────────────────────────────────────
+    df["day_of_week"] = df["ingestion_date"].dt.dayofweek
+    df["is_weekend"]  = (df["day_of_week"] >= 5).astype(float)
     df["day_sin"]     = np.sin(2 * np.pi * df["day_of_week"] / 7)
     df["day_cos"]     = np.cos(2 * np.pi * df["day_of_week"] / 7)
 
-    # Lag features per route (autoregressive signal)
-    grp = df.groupby(["route_id", "feed"])
-    df["lag_1_speed"] = grp["avg_speed_kmh"].shift(1)
-    df["lag_2_speed"] = grp["avg_speed_kmh"].shift(2)
-    df["lag_3_speed"] = grp["avg_speed_kmh"].shift(3)
-    df["rolling_7d_speed"] = (
-        grp["avg_speed_kmh"]
-        .transform(lambda x: x.rolling(7, min_periods=1).mean())
-    )
-    df["speed_momentum"] = df["avg_speed_kmh"] - df["lag_1_speed"]
+    # ── Encodings ─────────────────────────────────────────────────────────────
+    route_ids  = df["route_id"].unique()
+    route_map  = {r: i / len(route_ids) for i, r in enumerate(sorted(route_ids))}
+    feed_map   = {"bmtc": 0.0, "namma_metro": 1.0}
 
-    # Drop rows where we don't have enough history
-    df = df.dropna(subset=["lag_1_speed", "lag_2_speed"])
+    df["route_encoded"] = df["route_id"].map(route_map).fillna(0.5)
+    df["feed_encoded"]  = df["feed"].map(feed_map).fillna(0.0)
 
-    # Route encoding (ordinal for LSTM embedding)
-    route_map = {r: i for i, r in enumerate(df["route_id"].unique())}
-    df["route_encoded"] = df["route_id"].map(route_map)
+    # ── Speed tiers (classification-style features) ───────────────────────────
+    df["is_slow_route"]       = (df["avg_speed_kmh"] < 15).astype(float)
+    df["is_congested"]        = (df["stationary_pct"] > 20).astype(float)
+    df["peak_speed_ratio"]    = (
+        df["avg_speed_am_peak_kmh"] /
+        (df["avg_speed_pm_peak_kmh"] + 1e-6)
+    ).clip(0.1, 10)
 
-    feed_map = {"bmtc": 0, "namma_metro": 1}
-    df["feed_encoded"] = df["feed"].map(feed_map).fillna(0)
-
-    print(f"\nAfter feature engineering: {len(df):,} rows")
-    print(f"Feature columns: {[c for c in df.columns if c not in ['route_id','feed','ingestion_date']]}")
-    return df, route_map
-
-
-def build_sequences(df: pd.DataFrame, seq_len: int = SEQ_LEN):
-    """
-    Build (X, y) sequences for LSTM training.
-    X shape: (n_samples, seq_len, n_features)
-    y shape: (n_samples,) — next day's avg_speed_kmh
-    """
     feature_cols = [
-        "avg_speed_kmh", "avg_speed_am_peak_kmh", "avg_speed_pm_peak_kmh",
-        "stationary_pct", "slow_pct", "reliability_score",
-        "lag_1_speed", "lag_2_speed", "lag_3_speed",
-        "rolling_7d_speed", "speed_momentum",
-        "day_sin", "day_cos", "is_weekend",
-        "feed_encoded", "route_encoded",
+        "avg_speed_kmh",
+        "avg_speed_am_peak_kmh",
+        "avg_speed_pm_peak_kmh",
+        "stationary_pct",
+        "slow_pct",
+        "reliability_score",
         "unique_vehicles",
+        "speed_vs_network",
+        "reliable_vs_network",
+        "network_avg_speed",
+        "network_stationary",
+        "network_total_routes",
+        "day_sin",
+        "day_cos",
+        "is_weekend",
+        "feed_encoded",
+        "route_encoded",
+        "is_slow_route",
+        "is_congested",
+        "peak_speed_ratio",
     ]
 
-    X_list, y_list, meta_list = [], [], []
+    # Fill any remaining nulls
+    df[feature_cols] = df[feature_cols].fillna(0)
 
-    for (route_id, feed), group in df.groupby(["route_id", "feed"]):
-        group = group.sort_values("ingestion_date").reset_index(drop=True)
-        if len(group) < seq_len + 1:
-            continue  # not enough history for this route
-        vals = group[feature_cols].values.astype(np.float32)
-        targets = group[TARGET_COL].values.astype(np.float32)
-
-        for i in range(seq_len, len(group)):
-            X_list.append(vals[i - seq_len : i])
-            y_list.append(targets[i])
-            meta_list.append({
-                "route_id": route_id,
-                "feed": feed,
-                "date": group["ingestion_date"].iloc[i],
-            })
-
-    if not X_list:
-        raise ValueError(
-            f"No sequences built — need at least {seq_len + 1} days of data per route.\n"
-            f"Current data has {df['ingestion_date'].nunique()} unique dates.\n"
-            "Keep the pipeline running for more days, or reduce SEQ_LEN."
-        )
-
-    X = np.stack(X_list)  # (n, seq_len, n_features)
-    y = np.array(y_list)  # (n,)
-    print(f"\nSequences built: X={X.shape}, y={y.shape}")
-    return X, y, meta_list, feature_cols
+    print(f"  After feature engineering : {len(df):,} rows")
+    print(f"  Feature dimensions        : {len(feature_cols)}")
+    return df, feature_cols, route_map
 
 
-def normalize(X: np.ndarray, y: np.ndarray):
-    """Min-max normalize. Returns scaled arrays + scaler params for inference."""
-    X_min = X.min(axis=(0, 1), keepdims=True)
-    X_max = X.max(axis=(0, 1), keepdims=True)
+def normalize_features(df: pd.DataFrame, feature_cols: list):
+    """Min-max normalize. Returns array + scaler params."""
+    X = df[feature_cols].values.astype(np.float32)
+    y = df["avg_speed_kmh"].values.astype(np.float32)
+
+    X_min  = X.min(axis=0)
+    X_max  = X.max(axis=0)
     X_range = np.where((X_max - X_min) == 0, 1, X_max - X_min)
     X_scaled = (X - X_min) / X_range
 
-    y_min, y_max = y.min(), y.max()
-    y_range = y_max - y_min if y_max != y_min else 1
+    y_min   = float(y.min())
+    y_max   = float(y.max())
+    y_range = y_max - y_min if y_max != y_min else 1.0
     y_scaled = (y - y_min) / y_range
 
     scaler_params = {
-        "X_min": X_min, "X_max": X_max,
-        "y_min": float(y_min), "y_max": float(y_max),
+        "X_min":        X_min.tolist(),
+        "X_max":        X_max.tolist(),
+        "y_min":        y_min,
+        "y_max":        y_max,
+        "feature_cols": feature_cols,
+        "mode":         "cross_sectional",
+        "seq_len":      1,
     }
     return X_scaled, y_scaled, scaler_params
 
 
-def save_feature_store(X, y, meta, feature_cols, scaler_params) -> None:
+def save_outputs(df, X, y, scaler_params, feature_cols):
     FEATURE_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    meta_df = pd.DataFrame(meta)
+
+    # Save metadata
+    meta_df = df[["route_id", "feed", "ingestion_date"]].copy()
     meta_df["target_speed_kmh"] = y
     meta_df.to_parquet(FEATURE_OUTPUT, index=False)
 
-    # Save scaler params for inference
-    import json
-    scaler_path = FEATURE_OUTPUT.parent / "scaler_params.json"
-    serializable = {
-        "X_min": scaler_params["X_min"].tolist(),
-        "X_max": scaler_params["X_max"].tolist(),
-        "y_min": scaler_params["y_min"],
-        "y_max": scaler_params["y_max"],
-        "feature_cols": feature_cols,
-        "seq_len": SEQ_LEN,
-    }
-    with open(scaler_path, "w") as f:
-        json.dump(serializable, f, indent=2)
+    # Save feature matrix separately for training
+    np.save(FEATURE_OUTPUT.parent / "X_features.npy", X)
+    np.save(FEATURE_OUTPUT.parent / "y_targets.npy",  y)
 
-    print(f"\n✅ Feature store saved: {FEATURE_OUTPUT}")
-    print(f"✅ Scaler params saved: {scaler_path}")
-    print(f"   Samples: {len(meta_df)}")
-    print(f"   Target range: {y.min():.1f} – {y.max():.1f} km/h")
+    # Save scaler
+    scaler_path = FEATURE_OUTPUT.parent / "scaler_params.json"
+    with open(scaler_path, "w") as f:
+        json.dump(scaler_params, f, indent=2)
+
+    print(f"\n  ✅ Feature store : {FEATURE_OUTPUT}")
+    print(f"  ✅ X matrix      : {FEATURE_OUTPUT.parent}/X_features.npy  {X.shape}")
+    print(f"  ✅ y targets     : {FEATURE_OUTPUT.parent}/y_targets.npy   {y.shape}")
+    print(f"  ✅ Scaler        : {scaler_path}")
+    print(f"\n  Target range    : {y.min()*scaler_params['y_max']:.1f} – {scaler_params['y_max']:.1f} km/h")
+    print(f"  Samples ready   : {len(X):,}")
 
 
 def main():
     print("=" * 55)
-    print("  Feature Engineering Pipeline")
-    print("=" * 55)
+    print("  Feature Engineering Pipeline v2")
+    print("=" * 55 + "\n")
 
     df = load_gold_table()
-    df, route_map = engineer_features(df)
+    n_days = df["ingestion_date"].nunique()
 
-    # Handle case where we have limited data (early in pipeline)
-    available_days = df["ingestion_date"].nunique()
-    seq_len = min(SEQ_LEN, max(1, available_days - 1))
-    if seq_len < SEQ_LEN:
-        print(f"\n⚠️  Only {available_days} days of data — using seq_len={seq_len}")
-        print("   More data accumulates as the pipeline keeps running.")
+    if n_days >= MIN_DAYS_FOR_SEQUENCES:
+        print(f"\n  {n_days} days available → using sequence mode (SEQ_LEN={SEQ_LEN})")
+    else:
+        print(f"\n  {n_days} days available → using cross-sectional mode")
+        print(f"  (Switch to sequence mode after {MIN_DAYS_FOR_SEQUENCES} days)\n")
 
-    X, y, meta, feature_cols = build_sequences(df, seq_len=seq_len)
-    X_scaled, y_scaled, scaler_params = normalize(X, y)
-    save_feature_store(X_scaled, y_scaled, meta, feature_cols, scaler_params)
-    print(f"\n  Routes encoded: {len(route_map)}")
-    print(f"  Feature dims:  {X.shape[2]}")
+    df, feature_cols, route_map = build_cross_sectional_features(df)
+    X, y, scaler_params = normalize_features(df, feature_cols)
+    save_outputs(df, X, y, scaler_params, feature_cols)
+
+    print(f"\n  Routes encoded  : {len(route_map):,}")
+    print(f"  Ready to train  : python3 -m mlops_pipeline.training.train_eta_model")
 
 
 if __name__ == "__main__":

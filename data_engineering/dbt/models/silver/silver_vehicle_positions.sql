@@ -60,12 +60,12 @@ cleaned AS (
         
         -- THE RESCUE OPERATION: Fallback to ingested_at if event_ts is 1970
         CASE 
-            WHEN YEAR(event_ts) = 1970 THEN to_timestamp(ingested_at) 
+            WHEN YEAR(event_ts) = 1970 THEN to_timestamp(ingested_at) + INTERVAL 5 HOUR + INTERVAL 30 MINUTE
             ELSE event_ts 
         END AS event_ts,
         
         CASE 
-            WHEN YEAR(event_ts) = 1970 THEN CAST(to_timestamp(ingested_at) AS DATE) 
+            WHEN YEAR(event_ts) = 1970 THEN CAST(to_timestamp(ingested_at) + INTERVAL 5 HOUR + INTERVAL 30 MINUTE AS DATE) 
             ELSE ingestion_date 
         END AS ingestion_date,
         
