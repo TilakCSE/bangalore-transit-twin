@@ -35,6 +35,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depe
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+from serving_layer.api.predict import router as predict_router
 
 log = structlog.get_logger(__name__)
 
@@ -189,6 +190,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(predict_router)
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────

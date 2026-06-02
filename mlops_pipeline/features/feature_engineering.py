@@ -46,16 +46,19 @@ def load_gold_table() -> pd.DataFrame:
             route_id,
             feed,
             ingestion_date,
-            avg_speed_kmh,
-            COALESCE(avg_speed_am_peak_kmh, avg_speed_kmh) AS avg_speed_am_peak_kmh,
-            COALESCE(avg_speed_pm_peak_kmh, avg_speed_kmh) AS avg_speed_pm_peak_kmh,
-            COALESCE(stationary_pct, 0)   AS stationary_pct,
-            COALESCE(slow_pct, 0)         AS slow_pct,
-            COALESCE(reliability_score, 50) AS reliability_score,
-            unique_vehicles,
-            total_observations
+            COALESCE(unique_vehicles, 0)        AS unique_vehicles,
+            COALESCE(total_observations, 0)     AS total_observations,
+            COALESCE(stationary_pct, 0)         AS stationary_pct,
+            COALESCE(slow_pct, 0)               AS slow_pct,
+            COALESCE(reliability_score, 0)      AS reliability_score,
+            -- Derived targets with real variance
+            LN(COALESCE(total_observations, 1) + 1)  AS log_observations,
+            LN(COALESCE(unique_vehicles, 1) + 1)     AS log_vehicles
         FROM main_gold.gold_route_performance_daily
-        WHERE avg_speed_kmh IS NOT NULL
+        WHERE total_observations IS NOT NULL
+            AND total_observations > 0
+            AND route_id != 'UNKNOWN'
+            AND ingestion_date != '1970-01-21'
         ORDER BY route_id, feed, ingestion_date
     """).df()
     conn.close()
@@ -86,18 +89,13 @@ def build_cross_sectional_features(df: pd.DataFrame):
 
     # ── Network-level daily stats (context for each route) ────────────────────
     daily_network = df.groupby(["feed", "ingestion_date"]).agg(
-        network_avg_speed    = ("avg_speed_kmh",    "mean"),
-        network_med_speed    = ("avg_speed_kmh",    "median"),
-        network_avg_reliable = ("reliability_score","mean"),
-        network_total_routes = ("route_id",         "count"),
-        network_stationary   = ("stationary_pct",   "mean"),
+        network_total_routes = ("route_id",           "count"),
+        network_stationary   = ("stationary_pct",     "mean"),
+        network_avg_obs      = ("total_observations", "mean")
     ).reset_index()
 
     df = df.merge(daily_network, on=["feed", "ingestion_date"], how="left")
 
-    # ── Route relative to network ─────────────────────────────────────────────
-    df["speed_vs_network"]    = df["avg_speed_kmh"] / (df["network_avg_speed"] + 1e-6)
-    df["reliable_vs_network"] = df["reliability_score"] / (df["network_avg_reliable"] + 1e-6)
 
     # ── Time features ─────────────────────────────────────────────────────────
     df["day_of_week"] = df["ingestion_date"].dt.dayofweek
@@ -113,35 +111,21 @@ def build_cross_sectional_features(df: pd.DataFrame):
     df["route_encoded"] = df["route_id"].map(route_map).fillna(0.5)
     df["feed_encoded"]  = df["feed"].map(feed_map).fillna(0.0)
 
-    # ── Speed tiers (classification-style features) ───────────────────────────
-    df["is_slow_route"]       = (df["avg_speed_kmh"] < 15).astype(float)
-    df["is_congested"]        = (df["stationary_pct"] > 20).astype(float)
-    df["peak_speed_ratio"]    = (
-        df["avg_speed_am_peak_kmh"] /
-        (df["avg_speed_pm_peak_kmh"] + 1e-6)
-    ).clip(0.1, 10)
 
     feature_cols = [
-        "avg_speed_kmh",
-        "avg_speed_am_peak_kmh",
-        "avg_speed_pm_peak_kmh",
-        "stationary_pct",
-        "slow_pct",
-        "reliability_score",
-        "unique_vehicles",
-        "speed_vs_network",
-        "reliable_vs_network",
-        "network_avg_speed",
-        "network_stationary",
-        "network_total_routes",
-        "day_sin",
-        "day_cos",
-        "is_weekend",
-        "feed_encoded",
-        "route_encoded",
-        "is_slow_route",
-        "is_congested",
-        "peak_speed_ratio",
+    "total_observations",
+    "unique_vehicles",
+    "log_observations",
+    "log_vehicles",
+    "stationary_pct",
+    "slow_pct",
+    "network_total_routes",
+    "network_stationary",
+    "day_sin",
+    "day_cos",
+    "is_weekend",
+    "feed_encoded",
+    "route_encoded",
     ]
 
     # Fill any remaining nulls
@@ -155,7 +139,7 @@ def build_cross_sectional_features(df: pd.DataFrame):
 def normalize_features(df: pd.DataFrame, feature_cols: list):
     """Min-max normalize. Returns array + scaler params."""
     X = df[feature_cols].values.astype(np.float32)
-    y = df["avg_speed_kmh"].values.astype(np.float32)
+    y = df["log_observations"].values.astype(np.float32)
 
     X_min  = X.min(axis=0)
     X_max  = X.max(axis=0)
@@ -170,9 +154,10 @@ def normalize_features(df: pd.DataFrame, feature_cols: list):
     scaler_params = {
         "X_min":        X_min.tolist(),
         "X_max":        X_max.tolist(),
-        "y_min":        y_min,
-        "y_max":        y_max,
+        "y_min":        float(y.min()),
+        "y_max":        float(y.max()),
         "feature_cols": feature_cols,
+        "target_col":   "log_observations",
         "mode":         "cross_sectional",
         "seq_len":      1,
     }

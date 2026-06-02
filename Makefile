@@ -127,3 +127,8 @@ pre-commit-install:    ## Install pre-commit hooks
 
 pre-commit-run:        ## Run all pre-commit hooks on staged files
 	pre-commit run --all-files
+
+retrain:  ## Rebuild features and retrain model
+	set -a && source .env && set +a && \
+	python3 -m mlops_pipeline.features.feature_engineering && \
+	python3 -m mlops_pipeline.training.train_eta_model

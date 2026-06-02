@@ -201,14 +201,16 @@ services:
       - transit-net
 
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.13.0
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.mlflow
     ports:
       - "5000:5000"
     command: >
       mlflow server
       --host 0.0.0.0
       --port 5000
-      --backend-store-uri postgresql+psycopg2://airflow:airflow@postgres/airflow
+      --backend-store-uri postgresql+psycopg2://airflow:airflow@postgres/mlflow
       --default-artifact-root s3://mlflow-artifacts/
       --serve-artifacts
     environment:
@@ -252,6 +254,8 @@ services:
     build:
       context: .
       dockerfile: infrastructure/docker/Dockerfile.api
+    profiles:
+      - production
     ports:
       - "8000:8000"
     environment:
