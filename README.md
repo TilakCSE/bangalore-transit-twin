@@ -126,7 +126,7 @@ uvicorn serving_layer.api.main:app --reload --port 8000
 - [x] Flink delay detection job
 - [x] Iceberg lakehouse with dbt Medallion models
 - [x] LSTM ETA prediction model (Ray Train + MLflow)
-- [ ] FastAPI + WebSocket serving layer
+- [x] FastAPI + WebSocket serving layer
 - [ ] Blender city asset pipeline
 - [ ] Unity 6 HDRP scene + C# data bridge
 - [ ] Congestion heatmap shader
