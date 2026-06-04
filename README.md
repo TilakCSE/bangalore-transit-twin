@@ -127,8 +127,8 @@ uvicorn serving_layer.api.main:app --reload --port 8000
 - [x] Iceberg lakehouse with dbt Medallion models
 - [x] LSTM ETA prediction model (Ray Train + MLflow)
 - [x] FastAPI + WebSocket serving layer
-- [ ] Blender city asset pipeline
-- [ ] Unity 6 HDRP scene + C# data bridge
+- [x] Blender city asset pipeline
+- [x] Unity 6 HDRP scene + C# data bridge
 - [ ] Congestion heatmap shader
 - [ ] DVR time-scrubber feature
 - [ ] LLM RAG agent
