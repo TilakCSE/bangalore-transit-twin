@@ -2,7 +2,7 @@
 #  Bangalore Transit Digital Twin — Makefile
 #  Usage: make <target>
 # ─────────────────────────────────────────────────────────────────────────────
-
+SHELL := /bin/bash
 .PHONY: help up down logs ps test lint train-local kafka-topics status
 
 PYTHON := python3
